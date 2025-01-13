@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+from dask._task_spec import Alias
+from dask.base import collections_to_dsk
+
 pytest.importorskip("numpy")
 
 import numpy as np
@@ -11,7 +14,7 @@ from tlz import concat
 import dask
 import dask.array as da
 from dask.array.core import normalize_chunks
-from dask.array.numpy_compat import AxisError
+from dask.array.numpy_compat import NUMPY_GE_210, AxisError
 from dask.array.utils import assert_eq, same_keys
 
 
@@ -381,7 +384,7 @@ def test_meshgrid(shapes, chunks, indexing, sparse):
     r_a = np.meshgrid(*xi_a, indexing=indexing, sparse=sparse)
     r_d = da.meshgrid(*xi_d, indexing=indexing, sparse=sparse)
 
-    assert isinstance(r_d, list)
+    assert type(r_d) is type(r_a)
     assert len(r_a) == len(r_d)
 
     for e_r_a, e_r_d, i in zip(r_a, r_d, do):
@@ -511,6 +514,34 @@ def test_diag_extraction(k):
     # heterogeneous chunks:
     d = da.from_array(y, chunks=((3, 2), (4, 1, 2, 1)))
     assert_eq(da.diag(d, k), np.diag(y, k))
+
+
+def test_creation_data_producers():
+    x = np.arange(64).reshape((8, 8))
+    d = da.from_array(x, chunks=(4, 4))
+    dsk = collections_to_dsk([d])
+    assert all(v.data_producer for v in dsk.values())
+
+    # blockwise fusion
+    x = d.astype("float64")
+    dsk = collections_to_dsk([x])
+    assert sum(v.data_producer for v in dsk.values()) == 4
+    assert sum(isinstance(v, Alias) for v in dsk.values()) == 4
+    assert len(dsk) == 8
+
+    # linear fusion
+    x = d[slice(0, 6), None].astype("float64")
+    dsk = collections_to_dsk([x])
+    assert sum(v.data_producer for v in dsk.values()) == 4
+    assert sum(isinstance(v, Alias) for v in dsk.values()) == 4
+    assert len(dsk) == 8
+
+    # no fusion
+    x = d[[1, 3, 5, 7, 6, 4, 2, 0]].astype("float64")
+    dsk = collections_to_dsk([x])
+    assert sum(v.data_producer and "array-" in k[0] for k, v in dsk.items()) == 4
+    assert sum(v.data_producer for v in dsk.values()) == 8  # getitem data nodes
+    assert len(dsk) == 24
 
 
 def test_diagonal():
@@ -957,6 +988,22 @@ def test_nan_zeros_ones_like(fn, shape_chunks, dtype):
     )
 
 
+def test_from_array_getitem_fused():
+    arr = np.arange(100).reshape(10, 10)
+    darr = da.from_array(arr, chunks=(5, 5))
+    result = darr[slice(1, 5), :][slice(1, 3), :]
+    dsk = collections_to_dsk([result])
+    # Ensure that slices are merged properly
+    key = [k for k in dsk if "array-getitem" in k[0]][0]
+    key_2 = [
+        k
+        for k, v in dsk[key].args[0].items()
+        if "getitem" in k[0] and not isinstance(v, Alias)
+    ][0]
+    assert dsk[key].args[0][key_2].args[1] == ((slice(2, 4), slice(0, None)))
+    assert_eq(result, arr[slice(1, 5), :][slice(1, 3), :])
+
+
 @pytest.mark.parametrize("shape_chunks", [((50, 4), (10, 2)), ((50,), (10,))])
 @pytest.mark.parametrize("dtype", ["u4", np.float32, None, np.int64])
 def test_nan_empty_like(shape_chunks, dtype):
@@ -975,6 +1022,8 @@ def test_nan_empty_like(shape_chunks, dtype):
 @pytest.mark.parametrize("shape_chunks", [((50, 4), (10, 2)), ((50,), (10,))])
 @pytest.mark.parametrize("dtype", ["u4", np.float32, None, np.int64])
 def test_nan_full_like(val, shape_chunks, dtype):
+    if NUMPY_GE_210 and val == -1 and dtype == "u4":
+        pytest.xfail("can't insert negative numbers into unsigned integer")
     shape, chunks = shape_chunks
     x1 = da.random.standard_normal(size=shape, chunks=chunks)
     y1 = x1[x1 < 0.5]

@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import re
 import string
+import warnings
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 
-from dask.dataframe._compat import PANDAS_GE_220
+from dask.dataframe._compat import PANDAS_GE_220, PANDAS_GE_300
 from dask.dataframe._pyarrow import is_object_string_dtype
-from dask.dataframe.core import tokenize
 from dask.dataframe.io.utils import DataFrameIOFunction
+from dask.tokenize import tokenize
 from dask.utils import random_state_data
 
 __all__ = [
@@ -347,7 +349,8 @@ def make_partition(columns: list, dtypes: dict[str, type | str], index, kwargs, 
         if k in columns and not same_astype(v, df[k].dtype)
     }
     if update_dtypes:
-        df = df.astype(update_dtypes, copy=False)
+        kwargs = {} if PANDAS_GE_300 else {"copy": False}
+        df = df.astype(update_dtypes, **kwargs)
     return df
 
 
@@ -422,7 +425,7 @@ def make_timeseries(
     from dask.dataframe import _dask_expr_enabled
 
     if _dask_expr_enabled():
-        from dask_expr import from_map
+        from dask.dataframe.dask_expr import from_map
 
         k = {}
     else:
@@ -431,23 +434,27 @@ def make_timeseries(
         k = {"token": tokenize(start, end, dtypes, freq, partition_freq, state_data)}
 
     # Construct the output collection with from_map
-    return from_map(
-        MakeDataframePart(index_dtype, dtypes, kwargs),
-        parts,
-        meta=make_dataframe_part(
-            index_dtype,
-            meta_start,
-            meta_end,
-            dtypes,
-            list(dtypes.keys()),
-            state_data[0],
-            kwargs,
-        ),
-        divisions=divisions,
-        label="make-timeseries",
-        enforce_metadata=False,
-        **k,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="dask_expr does not", category=UserWarning
+        )
+        return from_map(
+            MakeDataframePart(index_dtype, dtypes, kwargs),
+            parts,
+            meta=make_dataframe_part(
+                index_dtype,
+                meta_start,
+                meta_end,
+                dtypes,
+                list(dtypes.keys()),
+                state_data[0],
+                kwargs,
+            ),
+            divisions=divisions,
+            label="make-timeseries",
+            enforce_metadata=False,
+            **k,
+        )
 
 
 def with_spec(spec: DatasetSpec, seed: int | None = None):
@@ -559,35 +566,28 @@ def with_spec(spec: DatasetSpec, seed: int | None = None):
 
     parts = [(divisions[i : i + 2], state_data[i]) for i in range(npartitions)]
 
-    from dask.dataframe import _dask_expr_enabled
+    from dask.dataframe import from_map
 
-    if _dask_expr_enabled():
-        from dask_expr import from_map
+    k = {}  # type: ignore
 
-        k = {}
-    else:
-        from dask.dataframe.io.io import from_map
-
-        k = {
-            "token": tokenize(
-                0, spec.nrecords, dtypes, step, partition_freq, state_data
-            )
-        }
-
-    return from_map(
-        MakeDataframePart(spec.index_spec.dtype, dtypes, kwargs, columns=columns),
-        parts,
-        meta=make_dataframe_part(
-            spec.index_spec.dtype,
-            meta_start,
-            meta_end,
-            dtypes,
-            columns,
-            state_data[0],
-            kwargs,
-        ),
-        divisions=divisions,
-        label="make-random",
-        enforce_metadata=False,
-        **k,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="dask_expr does not", category=UserWarning
+        )
+        return from_map(
+            MakeDataframePart(spec.index_spec.dtype, dtypes, kwargs, columns=columns),
+            parts,
+            meta=make_dataframe_part(
+                spec.index_spec.dtype,
+                meta_start,
+                meta_end,
+                dtypes,
+                columns,
+                state_data[0],
+                kwargs,
+            ),
+            divisions=divisions,
+            label="make-random",
+            enforce_metadata=False,
+            **k,
+        )

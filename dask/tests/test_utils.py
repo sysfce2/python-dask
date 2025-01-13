@@ -11,7 +11,6 @@ from tlz import curry
 
 from dask import get
 from dask.highlevelgraph import HighLevelGraph
-from dask.optimization import SubgraphCallable
 from dask.utils import (
     Dispatch,
     M,
@@ -43,7 +42,6 @@ from dask.utils import (
     random_state_data,
     skip_doctest,
     stringify,
-    stringify_collection_keys,
     takes_multiple_arguments,
     tmpfile,
     typename,
@@ -600,7 +598,7 @@ def test_derived_from():
     assert "not supported" in b_arg.lower()
     assert "dask" in b_arg.lower()
 
-    assert "  extra docstring\n\n" in Zap.f.__doc__
+    assert "extra docstring\n\n" in Zap.f.__doc__
 
 
 @pytest.mark.parametrize(
@@ -645,9 +643,8 @@ def test_derived_from_func():
 
 
 def test_derived_from_dask_dataframe():
+    pytest.importorskip("pandas")
     dd = pytest.importorskip("dask.dataframe")
-    if dd._dask_expr_enabled():
-        pytest.xfail("we don't have docs yet")
 
     assert "inconsistencies" in dd.DataFrame.dropna.__doc__
 
@@ -775,22 +772,6 @@ def test_stringify():
         skeys = [str(k) for k in keys]
         assert all(isinstance(k, str) for k in sdsk)
         assert get(dsk, keys) == get(sdsk, skeys)
-
-    dsk = {("y", 1): (SubgraphCallable({"x": ("y", 1)}, "x", (("y", 1),)), (("z", 1),))}
-    dsk = stringify(dsk, exclusive=set(dsk) | {("z", 1)})
-    assert dsk[("y", 1)][0].dsk["x"] == "('y', 1)"
-    assert dsk[("y", 1)][1][0] == "('z', 1)"
-
-
-def test_stringify_collection_keys():
-    obj = "Hello"
-    assert stringify_collection_keys(obj) is obj
-
-    obj = [("a", 0), (b"a", 0), (1, 1)]
-    res = stringify_collection_keys(obj)
-    assert res[0] == str(obj[0])
-    assert res[1] == str(obj[1])
-    assert res[2] == obj[2]
 
 
 @pytest.mark.parametrize(

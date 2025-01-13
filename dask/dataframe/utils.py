@@ -5,7 +5,7 @@ import re
 import sys
 import textwrap
 import traceback
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from numbers import Number
 from typing import TypeVar, overload
@@ -17,12 +17,9 @@ from pandas.api.types import is_dtype_equal
 import dask
 from dask.base import get_scheduler, is_dask_collection
 from dask.core import get_deps
-from dask.dataframe import (  # noqa: F401 register pandas extension types
-    _dtypes,
-    methods,
-)
-from dask.dataframe._compat import PANDAS_GE_150, tm  # noqa: F401
+from dask.dataframe._compat import tm  # noqa: F401
 from dask.dataframe.dispatch import (  # noqa : F401
+    is_categorical_dtype_dispatch,
     make_meta,
     make_meta_obj,
     meta_nonempty,
@@ -70,62 +67,6 @@ def is_float_na_dtype(t):
     return isinstance(dtype, types)
 
 
-def shard_df_on_index(df, divisions):
-    """Shard a DataFrame by ranges on its index
-
-    Examples
-    --------
-
-    >>> df = pd.DataFrame({'a': [0, 10, 20, 30, 40], 'b': [5, 4 ,3, 2, 1]})
-    >>> df
-        a  b
-    0   0  5
-    1  10  4
-    2  20  3
-    3  30  2
-    4  40  1
-
-    >>> shards = list(shard_df_on_index(df, [2, 4]))
-    >>> shards[0]
-        a  b
-    0   0  5
-    1  10  4
-
-    >>> shards[1]
-        a  b
-    2  20  3
-    3  30  2
-
-    >>> shards[2]
-        a  b
-    4  40  1
-
-    >>> list(shard_df_on_index(df, []))[0]  # empty case
-        a  b
-    0   0  5
-    1  10  4
-    2  20  3
-    3  30  2
-    4  40  1
-    """
-
-    if isinstance(divisions, Iterator):
-        divisions = list(divisions)
-    if not len(divisions):
-        yield df
-    else:
-        divisions = np.array(divisions)
-        df = df.sort_index()
-        index = df.index
-        if isinstance(index.dtype, pd.CategoricalDtype):
-            index = index.as_ordered()
-        indices = index.searchsorted(divisions)
-        yield df.iloc[: indices[0]]
-        for i in range(len(indices) - 1):
-            yield df.iloc[indices[i] : indices[i + 1]]
-        yield df.iloc[indices[-1] :]
-
-
 _META_TYPES = "meta : pd.DataFrame, pd.Series, dict, iterable, tuple, optional"
 _META_DESCRIPTION = """\
 An empty ``pd.DataFrame`` or ``pd.Series`` that matches the dtypes and
@@ -144,13 +85,11 @@ T = TypeVar("T", bound=Callable)
 
 
 @overload
-def insert_meta_param_description(func: T) -> T:
-    ...
+def insert_meta_param_description(func: T) -> T: ...
 
 
 @overload
-def insert_meta_param_description(pad: int) -> Callable[[T], T]:
-    ...
+def insert_meta_param_description(pad: int) -> Callable[[T], T]: ...
 
 
 def insert_meta_param_description(*args, **kwargs):
@@ -283,9 +222,9 @@ def clear_known_categories(x, cols=None, index=True, dtype_backend=None):
         # categorical accessor is not yet available
         return x
 
-    if isinstance(x, (pd.Series, pd.DataFrame)):
+    if not is_index_like(x):
         x = x.copy()
-        if isinstance(x, pd.DataFrame):
+        if is_dataframe_like(x):
             mask = x.dtypes == "category"
             if cols is None:
                 cols = mask[mask].index
@@ -293,12 +232,12 @@ def clear_known_categories(x, cols=None, index=True, dtype_backend=None):
                 raise ValueError("Not all columns are categoricals")
             for c in cols:
                 x[c] = x[c].cat.set_categories([UNKNOWN_CATEGORIES])
-        elif isinstance(x, pd.Series):
-            if isinstance(x.dtype, pd.CategoricalDtype):
+        elif is_series_like(x):
+            if is_categorical_dtype_dispatch(x.dtype):
                 x = x.cat.set_categories([UNKNOWN_CATEGORIES])
-        if index and isinstance(x.index, pd.CategoricalIndex):
+        if index and is_categorical_dtype_dispatch(x.index.dtype):
             x.index = x.index.set_categories([UNKNOWN_CATEGORIES])
-    elif isinstance(x, pd.CategoricalIndex):
+    elif is_categorical_dtype_dispatch(x.dtype):
         x = x.set_categories([UNKNOWN_CATEGORIES])
     return x
 
@@ -428,6 +367,8 @@ def check_meta(x, meta, funcname=None, numeric_equal=True):
 
 
 def check_matching_columns(meta, actual):
+    import dask.dataframe.methods as methods
+
     # Need nan_to_num otherwise nan comparison gives False
     if not np.array_equal(np.nan_to_num(meta.columns), np.nan_to_num(actual.columns)):
         extra = methods.tolist(actual.columns.difference(meta.columns))
@@ -435,10 +376,14 @@ def check_matching_columns(meta, actual):
         if extra or missing:
             extra_info = f"  Extra:   {extra}\n  Missing: {missing}"
         else:
-            extra_info = "Order of columns does not match"
+            extra_info = (
+                f"Order of columns does not match."
+                f"\nActual:   {actual.columns.tolist()}"
+                f"\nExpected: {meta.columns.tolist()}"
+            )
         raise ValueError(
             "The columns in the computed data do not match"
-            " the columns in the provided metadata\n"
+            " the columns in the provided metadata.\n"
             f"{extra_info}"
         )
 
@@ -526,6 +471,8 @@ def _check_dask(dsk, check_names=True, check_dtypes=True, result=None, scheduler
 
 
 def _maybe_sort(a, check_index: bool):
+    import dask.dataframe.methods as methods
+
     # sort by value, then index
     try:
         if is_dataframe_like(a):
@@ -833,25 +780,9 @@ def pyarrow_strings_enabled() -> bool:
     """Config setting to convert objects to pyarrow strings"""
     convert_string = dask.config.get("dataframe.convert-string")
     if convert_string is None:
-        from dask.dataframe._pyarrow import check_pyarrow_string_supported
-
-        try:
-            check_pyarrow_string_supported()
-            convert_string = True
-        except RuntimeError:
-            convert_string = False
+        convert_string = True
     return convert_string
 
 
 def get_numeric_only_kwargs(numeric_only: bool | NoDefault) -> dict:
     return {} if numeric_only is no_default else {"numeric_only": numeric_only}
-
-
-def check_numeric_only_valid(numeric_only: bool | NoDefault, name: str) -> dict:
-    if PANDAS_GE_150 and numeric_only is not no_default:
-        return {"numeric_only": numeric_only}
-    elif numeric_only is no_default:
-        return {}
-    raise NotImplementedError(
-        f"numeric_only is not implemented for {name} for pandas < 1.5."
-    )
