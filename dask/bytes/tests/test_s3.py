@@ -438,23 +438,14 @@ def test_modification_time_read_bytes(s3, s3so):
     assert [aa._key for aa in concat(a)] != [cc._key for cc in concat(c)]
 
 
-@pytest.fixture(
-    params=[
-        "pyarrow",
-        pytest.param(
-            "fastparquet", marks=pytest.mark.filterwarnings("ignore::FutureWarning")
-        ),
-    ]
-)
+@pytest.fixture(params=["pyarrow"])
 def engine(request):
     pytest.importorskip(request.param)
-    import dask.dataframe as dd
 
-    if dd._dask_expr_enabled() and request.param == "fastparquet":
-        pytest.skip("not supported")
     return request.param
 
 
+@pytest.mark.filterwarnings("ignore:Dask annotations")
 @pytest.mark.parametrize("metadata_file", [True, False])
 def test_parquet(s3, engine, s3so, metadata_file):
     dd = pytest.importorskip("dask.dataframe")
@@ -556,8 +547,6 @@ def test_parquet_append(s3, engine, s3so):
     dd = pytest.importorskip("dask.dataframe")
     pd = pytest.importorskip("pandas")
     np = pytest.importorskip("numpy")
-    if dd._dask_expr_enabled():
-        pytest.skip("need convert string option")
 
     url = "s3://%s/test.parquet.append" % test_bucket_name
 

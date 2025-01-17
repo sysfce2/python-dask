@@ -5,9 +5,10 @@ import warnings
 import numpy as np
 import pandas as pd
 
+import dask.dataframe as dd
 from dask.base import compute as dask_compute
 from dask.dataframe import methods
-from dask.dataframe.io.io import from_delayed, from_pandas
+from dask.dataframe._compat import PANDAS_GE_300
 from dask.dataframe.utils import pyarrow_strings_enabled
 from dask.delayed import delayed, tokenize
 from dask.utils import parse_bytes
@@ -123,15 +124,11 @@ def read_sql_query(
 
         if len(head) == 0:
             # no results at all
-            return from_pandas(head, npartitions=1)
+            return dd.from_pandas(head, npartitions=1)
 
         if pyarrow_strings_enabled():
-            from dask.dataframe._pyarrow import (
-                check_pyarrow_string_supported,
-                to_pyarrow_string,
-            )
+            from dask.dataframe._pyarrow import to_pyarrow_string
 
-            check_pyarrow_string_supported()
             # to estimate partition size with pyarrow strings
             head = to_pyarrow_string(head)
 
@@ -189,7 +186,7 @@ def read_sql_query(
 
     engine.dispose()
 
-    return from_delayed(parts, meta, divisions=divisions)
+    return dd.from_delayed(parts, meta, divisions)
 
 
 def read_sql_table(
@@ -409,7 +406,8 @@ def _read_sql_chunk(q, uri, meta, engine_kwargs=None, **kwargs):
         # required only for pandas < 1.0.0
         return df
     else:
-        return df.astype(meta.dtypes.to_dict(), copy=False)
+        kwargs = {} if PANDAS_GE_300 else {"copy": False}
+        return df.astype(meta.dtypes.to_dict(), **kwargs)
 
 
 def _to_sql_chunk(d, uri, engine_kwargs=None, **kwargs):

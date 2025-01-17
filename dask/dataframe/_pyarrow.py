@@ -3,27 +3,18 @@ from __future__ import annotations
 from functools import partial
 
 import pandas as pd
-from packaging.version import Version
 
-from dask.dataframe._compat import PANDAS_GE_150, PANDAS_GE_200
+from dask._compatibility import import_optional_dependency
 from dask.dataframe.utils import is_dataframe_like, is_index_like, is_series_like
 
-try:
-    import pyarrow as pa
-except ImportError:
-    pa = None
+pa = import_optional_dependency("pyarrow")
 
 
 def is_pyarrow_string_dtype(dtype):
     """Is the input dtype a pyarrow string?"""
     if pa is None:
         return False
-
-    if PANDAS_GE_150:
-        pa_string_types = [pd.StringDtype("pyarrow"), pd.ArrowDtype(pa.string())]
-    else:
-        pa_string_types = [pd.StringDtype("pyarrow")]
-    return dtype in pa_string_types
+    return dtype in (pd.StringDtype("pyarrow"), pd.ArrowDtype(pa.string()))
 
 
 def is_object_string_dtype(dtype):
@@ -109,17 +100,3 @@ to_object_string = partial(
     index_check=is_pyarrow_string_index,
     string_dtype=object,
 )
-
-
-def check_pyarrow_string_supported():
-    """Make sure we have all the required versions"""
-    if not PANDAS_GE_200:
-        raise RuntimeError(
-            "Using dask's `dataframe.convert-string` configuration "
-            "option requires `pandas>=2.0` to be installed."
-        )
-    if pa is None or Version(pa.__version__) < Version("12.0.0"):
-        raise RuntimeError(
-            "Using dask's `dataframe.convert-string` configuration "
-            "option requires `pyarrow>=12` to be installed."
-        )

@@ -12,7 +12,6 @@ from dask.array.dispatch import percentile_lookup
 from dask.array.percentile import _percentile
 from dask.backends import CreationDispatch, DaskBackendEntrypoint
 from dask.dataframe._compat import PANDAS_GE_220, is_any_real_numeric_dtype
-from dask.dataframe.core import DataFrame, Index, Scalar, Series, _Frame
 from dask.dataframe.dispatch import (
     categorical_dtype_dispatch,
     concat,
@@ -282,7 +281,7 @@ def make_meta_object(x, index=None):
     >>> make_meta_object(('a', 'f8'))
     Series([], Name: a, dtype: float64)
     >>> make_meta_object('i8')
-    1
+    np.int64(1)
     """
 
     if is_arraylike(x) and x.shape:
@@ -307,7 +306,7 @@ def make_meta_object(x, index=None):
         )
     elif not hasattr(x, "dtype") and x is not None:
         # could be a string, a dtype object, or a python type. Skip `None`,
-        # because it is implictly converted to `dtype('f8')`, which we don't
+        # because it is implicitly converted to `dtype('f8')`, which we don't
         # want here.
         try:
             dtype = np.dtype(x)
@@ -371,7 +370,12 @@ def _nonempty_index(idx):
         # `self.monotonic_increasing` or `self.monotonic_decreasing`
         try:
             return pd.date_range(
-                start=start, periods=2, freq=idx.freq, tz=idx.tz, name=idx.name
+                start=start,
+                periods=2,
+                freq=idx.freq,
+                tz=idx.tz,
+                name=idx.name,
+                unit=idx.unit,
             )
         except ValueError:  # older pandas versions
             data = [start, "1970-01-02"] if idx.freq is None else None
@@ -436,7 +440,7 @@ def _nonempty_series(s, idx=None):
         data = [s.iloc[0]] * 2
     elif isinstance(dtype, pd.DatetimeTZDtype):
         entry = pd.Timestamp("1970-01-01", tz=dtype.tz)
-        data = [entry, entry]
+        data = pd.array([entry, entry], dtype=dtype)
     elif isinstance(dtype, pd.CategoricalDtype):
         if len(s.cat.categories):
             data = [s.cat.categories[0]] * 2
@@ -493,26 +497,29 @@ def union_categoricals_pandas(to_union, sort_categories=False, ignore_order=Fals
 
 @get_parallel_type.register(pd.Series)
 def get_parallel_type_series(_):
+    from dask.dataframe.dask_expr._collection import Series
+
     return Series
 
 
 @get_parallel_type.register(pd.DataFrame)
 def get_parallel_type_dataframe(_):
+    from dask.dataframe.dask_expr._collection import DataFrame
+
     return DataFrame
 
 
 @get_parallel_type.register(pd.Index)
 def get_parallel_type_index(_):
+    from dask.dataframe.dask_expr._collection import Index
+
     return Index
-
-
-@get_parallel_type.register(_Frame)
-def get_parallel_type_frame(o):
-    return get_parallel_type(o._meta)
 
 
 @get_parallel_type.register(object)
 def get_parallel_type_object(_):
+    from dask.dataframe.dask_expr._collection import Scalar
+
     return Scalar
 
 
@@ -631,9 +638,11 @@ def concat_pandas(
             # converts series to dataframes with a single column named 0, then
             # concatenates.
             dfs3 = [
-                df
-                if isinstance(df, pd.DataFrame)
-                else df.to_frame().rename(columns={df.name: 0})
+                (
+                    df
+                    if isinstance(df, pd.DataFrame)
+                    else df.to_frame().rename(columns={df.name: 0})
+                )
                 for df in dfs2
             ]
             # pandas may raise a RuntimeWarning for comparing ints and strs
@@ -734,6 +743,8 @@ def get_grouper_pandas(obj):
 
 @percentile_lookup.register((pd.Series, pd.Index))
 def percentile(a, q, interpolation="linear"):
+    if isinstance(a.dtype, pd.ArrowDtype):
+        a = a.to_numpy()
     return _percentile(a, q, interpolation)
 
 
@@ -755,7 +766,7 @@ class PandasBackendEntrypoint(DataFrameBackendEntrypoint):
         return to_pandas_dispatch
 
     @classmethod
-    def to_backend(cls, data: _Frame, **kwargs):
+    def to_backend(cls, data, **kwargs):
         if isinstance(data._meta, (pd.DataFrame, pd.Series, pd.Index)):
             # Already a pandas-backed collection
             return data
@@ -771,13 +782,15 @@ dataframe_creation_dispatch.register_backend("pandas", PandasBackendEntrypoint()
 
 
 @concat_dispatch.register_lazy("cudf")
-@hash_object_dispatch.register_lazy("cudf")
+@from_pyarrow_table_dispatch.register_lazy("cudf")
 @group_split_dispatch.register_lazy("cudf")
 @get_parallel_type.register_lazy("cudf")
+@hash_object_dispatch.register_lazy("cudf")
 @meta_nonempty.register_lazy("cudf")
 @make_meta_dispatch.register_lazy("cudf")
 @make_meta_obj.register_lazy("cudf")
 @percentile_lookup.register_lazy("cudf")
+@to_pyarrow_table_dispatch.register_lazy("cudf")
 @tolist_dispatch.register_lazy("cudf")
 def _register_cudf():
     import dask_cudf  # noqa: F401

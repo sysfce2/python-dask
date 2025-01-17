@@ -150,6 +150,8 @@ html_theme_options = {"logo_only": True}
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ["_static"]
 
+html_js_files = ["custom.js"]
+
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.
 # html_last_updated_fmt = '%b %d, %Y'
@@ -313,9 +315,10 @@ epub_copyright = "2014-2018, Anaconda, Inc. and contributors"
 # epub_tocdup = True
 
 extlinks = {
-    "issue": ("https://github.com/dask/dask/issues/%s", "GH#"),
-    "pr": ("https://github.com/dask/dask/pull/%s", "GH#"),
-    "pr-distributed": ("https://github.com/dask/distributed/pull/%s", "GH#"),
+    "issue": ("https://github.com/dask/dask/issues/%s", "dask#"),
+    "pr": ("https://github.com/dask/dask/pull/%s", "dask#"),
+    "pr-distributed": ("https://github.com/dask/distributed/pull/%s", "distributed#"),
+    "pr-expr": ("https://github.com/dask/dask-expr/pull/%s", "dask-expr#"),
 }
 
 #  --Options for sphinx extensions -----------------------------------------------
@@ -345,7 +348,7 @@ intersphinx_mapping = {
         "https://filesystem-spec.readthedocs.io/en/latest/",
         "https://filesystem-spec.readthedocs.io/en/latest/objects.inv",
     ),
-    "click": ("https://click.palletsprojects.com/en/latest/", None),
+    "click": ("https://click.palletsprojects.com/", None),
     "scipy": ("https://docs.scipy.org/doc/scipy", None),
 }
 
@@ -411,6 +414,46 @@ redirect_files = [
     ("setup/prometheus.html", "how-to/setup-prometheus.html"),
     ("how-to/setup-prometheus.html", "prometheus.html"),
 ]
+
+for func in [
+    "aggregate",
+    "apply",
+    "bfill",
+    "count",
+    "cumcount",
+    "cumprod",
+    "cumsum",
+    "fillna",
+    "ffill",
+    "get_group",
+    "max",
+    "mean",
+    "min",
+    "size",
+    "std",
+    "sum",
+    "var",
+    "cov",
+    "corr",
+    "first",
+    "last",
+    "idxmin",
+    "idxmax",
+    "rolling",
+    "transform",
+]:
+    redirect_files.append(
+        (
+            f"generated/dask.dataframe.groupby.DataFrameGroupBy.{func}.html",
+            f"generated/dask.dataframe.api.GroupBy.{func}.html",
+        )
+    )
+    redirect_files.append(
+        (
+            f"generated/dask.dataframe.groupby.SeriesGroupBy.{func}.html",
+            f"generated/dask.dataframe.api.SeriesGroupBy.{func}.html",
+        )
+    )
 
 
 redirect_template = """\

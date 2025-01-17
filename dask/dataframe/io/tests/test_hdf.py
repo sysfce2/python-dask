@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+from functools import lru_cache
 from time import sleep
 
 import numpy as np
@@ -12,11 +13,10 @@ from packaging.version import Version
 import dask
 import dask.dataframe as dd
 from dask._compatibility import PY_VERSION
+from dask.core import get_deps
 from dask.dataframe._compat import tm
-from dask.dataframe.optimize import optimize_dataframe_getitem
 from dask.dataframe.utils import assert_eq
-from dask.layers import DataFrameIOLayer
-from dask.utils import dependency_depth, tmpdir, tmpfile
+from dask.utils import tmpdir, tmpfile
 
 # there's no support in upstream for writing HDF with extension dtypes yet.
 # see https://github.com/pandas-dev/pandas/issues/31199
@@ -136,16 +136,6 @@ def test_to_hdf_multiple_nodes():
             b.to_hdf(hdf, "/data*")
         out = dd.read_hdf(fn, "/data*")
         assert_eq(df16, out)
-
-    # Test getitem optimization
-    with tmpfile("h5") as fn:
-        a.to_hdf(fn, "/data*")
-        out = dd.read_hdf(fn, "/data*")[["x"]]
-        dsk = optimize_dataframe_getitem(out.dask, keys=out.__dask_keys__())
-        read = [key for key in dsk.layers if key.startswith("read-hdf")][0]
-        subgraph = dsk.layers[read]
-        assert isinstance(subgraph, DataFrameIOLayer)
-        assert subgraph.columns == ["x"]
 
 
 def test_to_hdf_multiple_files():
@@ -332,72 +322,18 @@ def test_to_hdf_modes_multiple_files():
         assert_eq(dd.concat([df, df]), out)
 
 
-def test_to_hdf_link_optimizations():
-    """testing dask link levels is correct by calculating the depth of the dask graph"""
-    pytest.importorskip("tables")
-    df16 = pd.DataFrame(
-        {
-            "x": [
-                "a",
-                "b",
-                "c",
-                "d",
-                "e",
-                "f",
-                "g",
-                "h",
-                "i",
-                "j",
-                "k",
-                "l",
-                "m",
-                "n",
-                "o",
-                "p",
-            ],
-            "y": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-        },
-        index=[
-            1.0,
-            2.0,
-            3.0,
-            4.0,
-            5.0,
-            6.0,
-            7.0,
-            8.0,
-            9.0,
-            10.0,
-            11.0,
-            12.0,
-            13.0,
-            14.0,
-            15.0,
-            16.0,
-        ],
-    )
-    a = dd.from_pandas(df16, 16)
+def dependency_depth(dsk):
+    deps, _ = get_deps(dsk)
 
-    # saving to multiple hdf files, no links are needed
-    # expected layers: from_pandas, to_hdf, list = depth of 3
-    with tmpdir() as dn:
-        fn = os.path.join(dn, "data*")
-        d = a.to_hdf(fn, "/data", compute=False)
-        assert dependency_depth(d.dask) == 3
+    @lru_cache(maxsize=None)
+    def max_depth_by_deps(key):
+        if not deps[key]:
+            return 1
 
-    # saving to a single hdf file with multiple nodes
-    # all subsequent nodes depend on the first
-    # expected layers: from_pandas, first to_hdf(creates file+node), subsequent to_hdfs, list = 4
-    with tmpfile() as fn:
-        d = a.to_hdf(fn, "/data*", compute=False)
-        assert dependency_depth(d.dask) == 4
+        d = 1 + max(max_depth_by_deps(dep_key) for dep_key in deps[key])
+        return d
 
-    # saving to a single hdf file with a single node
-    # every node depends on the previous node
-    # expected layers: from_pandas, to_hdf times npartitions(15), list = 2 + npartitions = 17
-    with tmpfile() as fn:
-        d = a.to_hdf(fn, "/data", compute=False)
-        assert dependency_depth(d.dask) == 2 + a.npartitions
+    return max(max_depth_by_deps(dep_key) for dep_key in deps.keys())
 
 
 @pytest.mark.skipif(
@@ -671,10 +607,6 @@ def test_read_hdf(data, compare):
         compare(
             dd.read_hdf(fn, "/data", chunksize=2, start=1, stop=3, mode="r").compute(),
             pd.read_hdf(fn, "/data", start=1, stop=3),
-        )
-
-        assert sorted(dd.read_hdf(fn, "/data", mode="r").dask) == sorted(
-            dd.read_hdf(fn, "/data", mode="r").dask
         )
 
     with tmpfile("h5") as fn:

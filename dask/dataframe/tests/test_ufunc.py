@@ -4,6 +4,8 @@ import warnings
 
 import pytest
 
+from dask.array.numpy_compat import NUMPY_GE_200
+
 pd = pytest.importorskip("pandas")
 
 import numpy as np
@@ -146,10 +148,6 @@ def test_ufunc(pandas_input, ufunc):
         assert_eq(dafunc(pandas_input), npfunc(pandas_input))
 
 
-@pytest.mark.skipif(
-    dd._dask_expr_enabled(),
-    reason="returns an Array on the expression level, which is something we can't represent at the moment",
-)
 @pytest.mark.parametrize(
     "ufunc",
     [
@@ -457,8 +455,7 @@ def test_mixed_types(ufunc, arg1, arg2):
     assert_eq(dafunc(arg2, arg1), npfunc(arg2, arg1))
 
 
-@pytest.mark.skipif(
-    dd._dask_expr_enabled(),
+@pytest.mark.xfail(
     reason="doesn't work at the moment, all return not implemented",
 )
 @pytest.mark.parametrize("ufunc", _UFUNCS_2ARG)
@@ -524,6 +521,14 @@ def test_ufunc_with_reduction(redfunc, ufunc, pandas):
     np_ufunc = getattr(np, ufunc)
 
     if (
+        NUMPY_GE_200
+        and redfunc == "prod"
+        and ufunc in ("floor", "ceil", "trunc")
+        and isinstance(pandas, pd.DataFrame)
+    ):
+        pytest.skip("Numpy started overflowing while we are casting to float")
+
+    if (
         redfunc == "prod"
         and ufunc in ["conj", "square", "negative", "absolute"]
         and isinstance(pandas, pd.DataFrame)
@@ -537,14 +542,7 @@ def test_ufunc_with_reduction(redfunc, ufunc, pandas):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         warnings.simplefilter("ignore", FutureWarning)
-        if dd._dask_expr_enabled():
-            import dask_expr as dx
-
-            assert isinstance(np_redfunc(dask), (dd.DataFrame, dd.Series, dx.Scalar))
-        else:
-            assert isinstance(
-                np_redfunc(dask), (dd.DataFrame, dd.Series, dd.core.Scalar)
-            )
+        assert isinstance(np_redfunc(dask), (dd.DataFrame, dd.Series, dd.Scalar))
         assert_eq(np_redfunc(np_ufunc(dask)), np_redfunc(np_ufunc(pandas)))
 
 

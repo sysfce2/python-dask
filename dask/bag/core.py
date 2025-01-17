@@ -38,6 +38,16 @@ from tlz import (
 )
 
 from dask import config
+from dask._task_spec import (
+    GraphNode,
+    List,
+    Task,
+    TaskRef,
+    _execute_subgraph,
+    convert_legacy_graph,
+    cull,
+    fuse_linear_task_spec,
+)
 from dask.bag import chunk
 from dask.bag.avro import to_avro
 from dask.base import (
@@ -47,19 +57,17 @@ from dask.base import (
     replace_name_in_key,
     tokenize,
 )
-from dask.blockwise import blockwise
+from dask.blockwise import _blockwise_unpack_collections_task_spec, blockwise
 from dask.context import globalmethod
-from dask.core import flatten, get_dependencies, istask, quote, reverse_dict
-from dask.delayed import Delayed, unpack_collections
+from dask.core import flatten, istask, quote
+from dask.delayed import Delayed
 from dask.highlevelgraph import HighLevelGraph
-from dask.optimization import cull, fuse, inline
 from dask.sizeof import sizeof
 from dask.typing import Graph, NestedKeys, no_default
 from dask.utils import (
     apply,
     digit,
     ensure_bytes,
-    ensure_dict,
     ensure_unicode,
     funcname,
     get_default_shuffle_method,
@@ -94,16 +102,49 @@ def lazify_task(task, start=True):
     >>> lazify_task(task)  # doctest: +ELLIPSIS
     (<built-in function sum>, (<class 'map'>, <function inc at ...>, [1, 2, 3]))
     """
-    if type(task) is list and len(task) < 50:
-        return [lazify_task(arg, False) for arg in task]
-    if not istask(task):
-        return task
-    head, tail = task[0], task[1:]
-    if not start and head in (list, reify):
-        task = task[1]
-        return lazify_task(*tail, start=False)
+
+    if isinstance(task, GraphNode):
+        if isinstance(task, List) and len(task.args) < 50:
+            return List(*[lazify_task(arg, False) for arg in task.args])
+        if not isinstance(task, Task):
+            return task
+        if not start and task.func in (list, reify) and isinstance(task.args[0], Task):
+            assert len(task.args) == 1
+            task = task.args[0]
+        if task.func is _execute_subgraph:
+            subgraph, outkey, inkeys, *dependencies = task.args
+            # If there is a reify at the output of the subgraph we don't want to act
+            final_task = lazify_task(subgraph[outkey], True)
+            subgraph = {
+                k: lazify_task(v, False) for k, v in subgraph.items() if k != outkey
+            }
+            subgraph[outkey] = final_task
+            return Task(
+                task.key,
+                _execute_subgraph,
+                subgraph,
+                outkey,
+                inkeys,
+                *dependencies,
+                _data_producer=task.data_producer,
+            )
+        return Task(
+            task.key,
+            task.func,
+            *[lazify_task(arg, False) for arg in task.args],
+            **task.kwargs,
+        )
     else:
-        return (head,) + tuple(lazify_task(arg, False) for arg in tail)
+        if type(task) is list and len(task) < 50:
+            return [lazify_task(arg, False) for arg in task]
+        if not istask(task):
+            return task
+        head, tail = task[0], task[1:]
+        if not start and head in (list, reify):
+            task = task[1]
+            return lazify_task(*tail, start=False)
+        else:
+            return (head,) + tuple(lazify_task(arg, False) for arg in tail)
 
 
 def lazify(dsk):
@@ -117,43 +158,14 @@ def lazify(dsk):
     return valmap(lazify_task, dsk)
 
 
-def inline_singleton_lists(dsk, keys, dependencies=None):
-    """Inline lists that are only used once.
-
-    >>> d = {'b': (list, 'a'),
-    ...      'c': (sum, 'b', 1)}
-    >>> inline_singleton_lists(d, 'c')
-    {'c': (<built-in function sum>, (<class 'list'>, 'a'), 1)}
-
-    Pairs nicely with lazify afterwards.
-    """
-    if dependencies is None:
-        dependencies = {k: get_dependencies(dsk, task=v) for k, v in dsk.items()}
-    dependents = reverse_dict(dependencies)
-
-    inline_keys = {
-        k
-        for k, v in dsk.items()
-        if istask(v) and v and v[0] is list and len(dependents[k]) == 1
-    }
-    inline_keys.difference_update(flatten(keys))
-    dsk = inline(dsk, inline_keys, inline_constants=False)
-    for k in inline_keys:
-        del dsk[k]
-    return dsk
-
-
-def optimize(dsk, keys, fuse_keys=None, rename_fused_keys=None, **kwargs):
+def optimize(dsk, keys, fuse_keys=None, **kwargs):
     """Optimize a dask from a dask Bag."""
-    dsk = ensure_dict(dsk)
-    dsk2, dependencies = cull(dsk, keys)
-    kwargs = {}
-    if rename_fused_keys is not None:
-        kwargs["rename_keys"] = rename_fused_keys
-    dsk3, dependencies = fuse(dsk2, keys + (fuse_keys or []), dependencies, **kwargs)
-    dsk4 = inline_singleton_lists(dsk3, keys, dependencies)
-    dsk5 = lazify(dsk4)
-    return dsk5
+    dsk = convert_legacy_graph(dsk)
+    keys = list(flatten(keys))
+    dsk2 = cull(dsk, keys)
+    dsk3 = fuse_linear_task_spec(dsk2, keys + (fuse_keys or []))
+    dsk4 = lazify(dsk3)
+    return dsk4
 
 
 def _to_textfiles_chunk(data, lazy_file, last_endline):
@@ -1621,7 +1633,9 @@ class Bag(DaskMethodsMixin):
             dsk = dfs.dask
 
         divisions = [None] * (self.npartitions + 1)
-        return dd.DataFrame(dsk, dfs.name, meta, divisions)
+        from dask.dataframe.dask_expr import from_graph
+
+        return from_graph(dsk, meta, divisions, dfs.__dask_keys__(), "from-bag")
 
     def to_delayed(self, optimize_graph=True):
         """Convert into a list of ``dask.delayed`` objects, one per partition.
@@ -1735,7 +1749,7 @@ def partition(grouper, sequence, npartitions, p, nelements=2**20):
         d = groupby(grouper, block)
         d2 = defaultdict(list)
         for k, v in d.items():
-            d2[abs(hash(k)) % npartitions].extend(v)
+            d2[abs(int(tokenize(k), 16)) % npartitions].extend(v)
         p.append(d2, fsync=True)
     return p
 
@@ -2081,14 +2095,12 @@ def unpack_scalar_dask_kwargs(kwargs):
     kwargs2 = {}
     dependencies = []
     for k, v in kwargs.items():
-        vv, collections = unpack_collections(v)
+        vv, collections = _blockwise_unpack_collections_task_spec(v)
         if not collections:
             kwargs2[k] = v
         else:
             kwargs2[k] = vv
             dependencies.extend(collections)
-    if dependencies:
-        kwargs2 = (dict, (zip, list(kwargs2), list(kwargs2.values())))
     return kwargs2, dependencies
 
 
@@ -2255,11 +2267,10 @@ def map_partitions(func, *args, **kwargs):
         if isinstance(a, Bag):
             bags.append(a)
             args2.append(a)
-        elif isinstance(a, (Item, Delayed)):
-            args2.append(a.key)
-            dependencies.append(a)
         else:
+            a, collections = _blockwise_unpack_collections_task_spec(a)
             args2.append(a)
+            dependencies.extend(collections)
 
     bag_kwargs = {}
     other_kwargs = {}
@@ -2281,26 +2292,29 @@ def map_partitions(func, *args, **kwargs):
         raise ValueError("All bags must have the same number of partitions.")
     npartitions = npartitions.pop()
 
-    def build_args(n):
-        return [(a.name, n) if isinstance(a, Bag) else a for a in args2]
-
-    def build_bag_kwargs(n):
-        if not bag_kwargs:
-            return {}
-        return (
-            dict,
-            (zip, list(bag_kwargs), [(b.name, n) for b in bag_kwargs.values()]),
-        )
-
     if bag_kwargs:
+
+        def build_args(n):
+            return [TaskRef((a.name, n)) if isinstance(a, Bag) else a for a in args2]
+
+        def build_bag_kwargs(n) -> dict:
+            if not bag_kwargs:
+                return other_kwargs
+            rv = {
+                k: TaskRef((b.name, n)) if isinstance(b, Bag) else b
+                for k, b in bag_kwargs.items()
+            }
+            rv.update(other_kwargs)
+            return rv
+
         # Avoid using `blockwise` when a key-word
         # argument is being used to refer to a collection.
         dsk = {
-            (name, n): (
-                apply,
+            (name, n): Task(
+                (name, n),
                 func,
-                build_args(n),
-                (merge, build_bag_kwargs(n), other_kwargs),
+                *build_args(n),
+                **build_bag_kwargs(n),
             )
             for n in range(npartitions)
         }
@@ -2315,12 +2329,6 @@ def map_partitions(func, *args, **kwargs):
                 numblocks[arg.name] = (arg.npartitions,)
             else:
                 pairs.extend([arg, None])
-        if other_kwargs and isinstance(other_kwargs, tuple):
-            # `other_kwargs` is a nested subgraph,
-            # designed to generate the kwargs lazily.
-            # We need to convert this to a dictionary
-            # before passing to `blockwise`
-            other_kwargs = other_kwargs[0](other_kwargs[1][0](*other_kwargs[1][1:]))
         dsk = blockwise(
             func,
             name,
@@ -2355,7 +2363,7 @@ def make_group(k, stage):
     return h
 
 
-def groupby_tasks(b, grouper, hash=hash, max_branch=32):
+def groupby_tasks(b, grouper, hash=lambda x: int(tokenize(x), 16), max_branch=32):
     max_branch = max_branch or 32
     n = b.npartitions
 
@@ -2562,7 +2570,7 @@ def random_state_data_python(
 
         random_data = np_rng.bytes(624 * n * 4)  # `n * 624` 32-bit integers
         arr = np.frombuffer(random_data, dtype=np.uint32).reshape((n, -1))
-        return [(3, tuple(row) + (624,), None) for row in arr.tolist()]
+        return [(3, tuple(row) + (624,), None) for row in arr.tolist()]  # type: ignore
 
     except ImportError:
         # Pure python (much slower)
@@ -2596,13 +2604,16 @@ def split(seq, n):
 
 def to_dataframe(seq, columns, dtypes):
     import pandas as pd
+    from packaging.version import Version
 
     seq = reify(seq)
     # pd.DataFrame expects lists, only copy if necessary
     if not isinstance(seq, list):
         seq = list(seq)
+
+    kwargs = {} if Version(pd.__version__).major >= 3 else {"copy": False}
     res = pd.DataFrame(seq, columns=list(columns))
-    return res.astype(dtypes, copy=False)
+    return res.astype(dtypes, **kwargs)
 
 
 def repartition_npartitions(bag, npartitions):

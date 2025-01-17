@@ -34,10 +34,11 @@ from dask.base import (
     unpack_collections,
     visualize,
 )
+from dask.core import validate_key
 from dask.delayed import Delayed, delayed
 from dask.diagnostics import Profiler
 from dask.highlevelgraph import HighLevelGraph
-from dask.utils import tmpdir, tmpfile
+from dask.utils import key_split, tmpdir, tmpfile
 from dask.utils_test import dec, import_or_none, inc
 
 da = import_or_none("dask.array")
@@ -67,16 +68,17 @@ def test_is_dask_collection():
 
 def test_is_dask_collection_dask_expr():
     pd = pytest.importorskip("pandas")
-    dx = pytest.importorskip("dask_expr")
+    dd = pytest.importorskip("dask.dataframe")
 
     df = pd.Series([1, 2, 3])
-    dxf = dx.from_pandas(df)
+    ddf = dd.from_pandas(df)
     assert not is_dask_collection(df)
-    assert is_dask_collection(dxf)
+    assert is_dask_collection(ddf)
 
 
 def test_is_dask_collection_dask_expr_does_not_materialize():
-    dx = pytest.importorskip("dask_expr")
+    pytest.importorskip("pandas")
+    dx = pytest.importorskip("dask.dataframe.dask_expr")
 
     class DoNotMaterialize(dx._core.Expr):
         @property
@@ -369,7 +371,7 @@ def test_compute_no_opt():
     # Otherwise, the lengths below would be 4 and 0.
     assert len([k for k in keys if "mul" in k[0]]) == 8
     assert len([k for k in keys if "add" in k[0]]) == 4
-    assert len([k for k in keys if "add-mul" in k[0]]) == 4  # See? Renamed
+    assert len([k for k in keys if "add-from_sequence-mul" in k[0]]) == 4
 
 
 @pytest.mark.skipif("not da")
@@ -427,7 +429,7 @@ def test_persist_dataframe():
     assert len(ddf1.__dask_graph__()) == 4
     ddf2 = ddf1.persist()
     assert isinstance(ddf2, dd.DataFrame)
-    assert len(ddf2.__dask_graph__()) == 2 if not dd._dask_expr_enabled() else 4
+    assert len(ddf2.__dask_graph__()) == 4
     dd.utils.assert_eq(ddf2, ddf1)
 
 
@@ -438,7 +440,7 @@ def test_persist_series():
     assert len(dds1.__dask_graph__()) == 4
     dds2 = dds1.persist()
     assert isinstance(dds2, dd.Series)
-    assert len(dds2.__dask_graph__()) == 2 if not dd._dask_expr_enabled() else 4
+    assert len(dds2.__dask_graph__()) == 4
     dd.utils.assert_eq(dds2, dds1)
 
 
@@ -448,61 +450,11 @@ def test_persist_scalar():
 
     ds = pd.Series([1, 2, 3, 4])
     dds1 = dd.from_pandas(ds, npartitions=2).min()
-    assert len(dds1.__dask_graph__()) == 5 if not dd._dask_expr_enabled() else 6
+    assert len(dds1.__dask_graph__()) == 5
     dds2 = dds1.persist()
-    if not dd._dask_expr_enabled():
-        assert isinstance(dds2, dd.core.Scalar)
-    assert len(dds2.__dask_graph__()) == 1 if not dd._dask_expr_enabled() else 2
+    assert isinstance(dds2, dd.Scalar)
+    assert len(dds2.__dask_graph__()) == 2
     dd.utils.assert_eq(dds2, dds1)
-
-
-@pytest.mark.skipif("not dd")
-def test_persist_dataframe_rename():
-    import dask.dataframe as dd
-
-    if dd._dask_expr_enabled():
-        pytest.skip("doesn't make sense")
-
-    df1 = pd.DataFrame({"a": [1, 2, 3, 4], "b": [5, 6, 7, 8]})
-    df2 = pd.DataFrame({"a": [2, 3, 5, 6], "b": [6, 7, 9, 10]})
-    ddf1 = dd.from_pandas(df1, npartitions=2)
-    rebuild, args = ddf1.__dask_postpersist__()
-    dsk = {("x", 0): df2.iloc[:2], ("x", 1): df2.iloc[2:]}
-    ddf2 = rebuild(dsk, *args, rename={ddf1._name: "x"})
-    assert ddf2.__dask_keys__() == [("x", 0), ("x", 1)]
-    dd.utils.assert_eq(ddf2, df2)
-
-
-@pytest.mark.skipif("not dd")
-def test_persist_series_rename():
-    import dask.dataframe as dd
-
-    if dd._dask_expr_enabled():
-        pytest.skip("doesn't make sense")
-
-    ds1 = pd.Series([1, 2, 3, 4])
-    ds2 = pd.Series([5, 6, 7, 8])
-    dds1 = dd.from_pandas(ds1, npartitions=2)
-    rebuild, args = dds1.__dask_postpersist__()
-    dsk = {("x", 0): ds2.iloc[:2], ("x", 1): ds2.iloc[2:]}
-    dds2 = rebuild(dsk, *args, rename={dds1._name: "x"})
-    assert dds2.__dask_keys__() == [("x", 0), ("x", 1)]
-    dd.utils.assert_eq(dds2, ds2)
-
-
-@pytest.mark.skipif("not dd")
-def test_persist_scalar_rename():
-    import dask.dataframe as dd
-
-    if dd._dask_expr_enabled():
-        pytest.skip("doesn't make sense")
-
-    ds1 = pd.Series([1, 2, 3, 4])
-    dds1 = dd.from_pandas(ds1, npartitions=2).min()
-    rebuild, args = dds1.__dask_postpersist__()
-    dds2 = rebuild({("x", 0): 5}, *args, rename={dds1._name: "x"})
-    assert dds2.__dask_keys__() == [("x", 0)]
-    dd.utils.assert_eq(dds2, 5)
 
 
 @pytest.mark.skipif("not dd or not da")
@@ -882,6 +834,7 @@ def test_persist_item_change_name():
 
 
 def test_optimize_globals():
+    pytest.importorskip("numpy")
     da = pytest.importorskip("dask.array")
 
     x = da.ones(10, chunks=(5,))
@@ -906,6 +859,7 @@ def test_optimize_globals():
 
 
 def test_optimize_None():
+    pytest.importorskip("numpy")
     da = pytest.importorskip("dask.array")
 
     x = da.ones(10, chunks=(5,))
@@ -997,31 +951,30 @@ def test_num_workers_config(scheduler):
 
 
 def test_optimizations_ctd():
+    pytest.importorskip("numpy")
     da = pytest.importorskip("dask.array")
     x = da.arange(2, chunks=1)[:1]
     dsk1 = collections_to_dsk([x])
     with dask.config.set({"optimizations": [lambda dsk, keys: dsk]}):
         dsk2 = collections_to_dsk([x])
-
     assert dsk1 == dsk2
 
 
 def test_clone_key():
-    assert clone_key("inc-1-2-3", 123) == "inc-73db79fdf4518507ddc84796726d4844"
-    assert clone_key("x", 123) == "x-c4fb64ccca807af85082413d7ef01721"
-    assert clone_key("x", 456) == "x-d4b538b4d4cf68fca214077609feebae"
-    assert clone_key(("x", 1), 456) == ("x-d4b538b4d4cf68fca214077609feebae", 1)
-    assert clone_key(("sum-1-2-3", h1, 1), 123) == (
-        "sum-822e7622aa1262cef988b3033c32aa37",
-        h1,
-        1,
-    )
+    for key, seed in [("x", 123), (("x", 1), 456), (("sum-1-2-3", h1, 1), 123)]:
+        validate_key(clone_key(key, seed))
+        assert clone_key(key, seed) != key
+        assert clone_key(key, seed) == clone_key(key, seed)
+        assert clone_key(key, seed) != clone_key(key, seed + 1)
+        assert key_split(clone_key(key, seed)) == key_split(key)
+
     with pytest.raises(TypeError):
         clone_key(1, 2)
 
 
 def test_compute_as_if_collection_low_level_task_graph():
     # See https://github.com/dask/dask/pull/7969
+    pytest.importorskip("numpy")
     da = pytest.importorskip("dask.array")
     x = da.arange(10)
 
@@ -1078,8 +1031,6 @@ def check_default_scheduler(module, collection, expected, emscripten):
 @pytest.mark.parametrize(
     "params",
     (
-        "'dask.dataframe', '_Frame', 'sync', True",
-        "'dask.dataframe', '_Frame', 'threads', False",
         "'dask.array', 'Array', 'sync', True",
         "'dask.array', 'Array', 'threads', False",
         "'dask.bag', 'Bag', 'sync', True",
@@ -1087,10 +1038,9 @@ def check_default_scheduler(module, collection, expected, emscripten):
     ),
 )
 def test_emscripten_default_scheduler(params):
+    pytest.importorskip("numpy")
     pytest.importorskip("dask.array")
-    dd = pytest.importorskip("dask.dataframe")
-    if dd._dask_expr_enabled() and "dask.dataframe" in params:
-        pytest.skip("objects not available")
+    pytest.importorskip("pandas")
     proc = subprocess.run(
         [
             sys.executable,

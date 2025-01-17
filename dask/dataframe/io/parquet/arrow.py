@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import itertools
 import json
 import operator
 import textwrap
-import warnings
 from collections import defaultdict
 from datetime import datetime
 from functools import reduce
@@ -11,7 +11,6 @@ from functools import reduce
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pyarrow.fs as pa_fs
 import pyarrow.parquet as pq
 
 # Check PyArrow version for feature support
@@ -20,8 +19,6 @@ from fsspec.implementations.arrow import ArrowFSWrapper
 from pyarrow import dataset as pa_ds
 from pyarrow import fs as pa_fs
 
-import dask
-from dask.base import normalize_token, tokenize
 from dask.core import flatten
 from dask.dataframe._compat import PANDAS_GE_220
 from dask.dataframe.backends import pyarrow_schema_dispatch
@@ -39,6 +36,7 @@ from dask.dataframe.io.parquet.utils import (
 from dask.dataframe.io.utils import _get_pyarrow_dtypes, _is_local_fs, _open_input_files
 from dask.dataframe.utils import clear_known_categories, pyarrow_strings_enabled
 from dask.delayed import Delayed
+from dask.tokenize import normalize_token, tokenize
 from dask.utils import getargspec, natural_sort_key
 
 PYARROW_NULLABLE_DTYPE_MAPPING = {
@@ -287,9 +285,19 @@ def _get_rg_statistics(row_group, col_names):
     statistics for all columns.
     """
 
-    row_group_schema = {
-        col_name: i for i, col_name in enumerate(row_group.schema.names)
-    }
+    row_group_schema = dict(
+        zip(
+            row_group.schema.names,
+            itertools.accumulate(
+                [
+                    # Need to account for multi-field struct columns
+                    max(row_group.schema.types[i].num_fields, 1)
+                    for i in range(len(row_group.schema.names) - 1)
+                ],
+                initial=0,
+            ),
+        )
+    )
 
     def name_stats(column_name):
         col = row_group.metadata.column(row_group_schema[column_name])
@@ -497,83 +505,6 @@ class ArrowDatasetEngine(Engine):
             open_file_options,
             storage_options,
         )
-
-    @classmethod
-    def read_metadata(
-        cls,
-        fs,
-        paths,
-        categories=None,
-        index=None,
-        use_nullable_dtypes=None,
-        dtype_backend=None,
-        gather_statistics=None,
-        filters=None,
-        split_row_groups="adaptive",
-        blocksize=None,
-        aggregate_files=None,
-        ignore_metadata_file=False,
-        metadata_task_size=0,
-        parquet_file_extension=None,
-        **kwargs,
-    ):
-        if use_nullable_dtypes is not None and dtype_backend is not None:
-            raise ValueError(
-                "`use_nullable_dtypes` is deprecated. Use `dtype_backend` keyword argument instead."
-            )
-
-        if use_nullable_dtypes is not None:
-            warnings.warn(
-                "The `use_nullable_dtypes=` keyword argument and `dataframe.dtype_backend` "
-                "config option are deprecated, and will be removed in the future. "
-                "Use the `dtype_backend=` keyword argument instead.",
-                category=FutureWarning,
-            )
-            if use_nullable_dtypes:
-                config_backend = dask.config.get("dataframe.dtype_backend", None)
-                # Meaning of old "pandas" config is now the same as "numpy_nullable"
-                if config_backend in (None, "pandas"):
-                    config_backend = "numpy_nullable"
-                dtype_backend = config_backend
-
-        if dtype_backend not in (None, "numpy_nullable", "pyarrow"):
-            raise ValueError(
-                f"`dtype_backend` should be one of [None, 'numpy_nullable', 'pyarrow'], got {dtype_backend}"
-            )
-        kwargs["dtype_backend"] = dtype_backend
-
-        # Stage 1: Collect general dataset information
-        dataset_info = cls._collect_dataset_info(
-            paths,
-            fs,
-            categories,
-            index,
-            gather_statistics,
-            filters,
-            split_row_groups,
-            blocksize,
-            aggregate_files,
-            ignore_metadata_file,
-            metadata_task_size,
-            parquet_file_extension,
-            kwargs,
-        )
-
-        # Stage 2: Generate output `meta`
-        meta = cls._create_dd_meta(dataset_info)
-
-        # Stage 3: Generate parts and stats
-        parts, stats, common_kwargs = cls._construct_collection_plan(dataset_info)
-
-        # Add `common_kwargs` and `aggregation_depth` to the first
-        # element of `parts`. We can return as a separate element
-        # in the future, but should avoid breaking the API for now.
-        if len(parts):
-            parts[0]["common_kwargs"] = common_kwargs
-            parts[0]["aggregation_depth"] = dataset_info["aggregation_depth"]
-            parts[0]["split_row_groups"] = dataset_info["split_row_groups"]
-
-        return (meta, stats, parts, dataset_info["index"])
 
     @classmethod
     def multi_support(cls):
@@ -1373,7 +1304,7 @@ class ArrowDatasetEngine(Engine):
         for i, name in enumerate(schema.names):
             if name in _index_cols or name in filter_columns:
                 if name in partition_names:
-                    # Partition columns wont have statistics
+                    # Partition columns won't have statistics
                     continue
                 stat_col_indices[name] = i
 
@@ -1408,7 +1339,7 @@ class ArrowDatasetEngine(Engine):
                 common_kwargs,
             )
 
-        # Get/transate filters
+        # Get/translate filters
         ds_filters = None
         if filters is not None:
             ds_filters = _filters_to_expression(filters)
@@ -1545,7 +1476,7 @@ class ArrowDatasetEngine(Engine):
         aggregation_depth = dataset_info_kwargs["aggregation_depth"]
         blocksize = dataset_info_kwargs["blocksize"]
 
-        # Intialize row-group and statistics data structures
+        # Initialize row-group and statistics data structures
         file_row_groups = defaultdict(list)
         file_row_group_stats = defaultdict(list)
         file_row_group_column_stats = defaultdict(list)
@@ -1908,7 +1839,7 @@ class ArrowDatasetEngine(Engine):
             metadata_path = fs.sep.join([out_path, "_metadata"])
             with fs.open(metadata_path, "wb") as fil:
                 if not meta:
-                    raise ValueError("Cannot write empty metdata!")
+                    raise ValueError("Cannot write empty metadata!")
                 meta.write_metadata_file(fil)
             return None
         else:

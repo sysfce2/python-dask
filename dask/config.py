@@ -198,15 +198,13 @@ def _load_config_file(path: str) -> dict | None:
 @overload
 def collect_yaml(
     paths: Sequence[str], *, return_paths: Literal[False] = False
-) -> Iterator[dict]:
-    ...
+) -> Iterator[dict]: ...
 
 
 @overload
 def collect_yaml(
     paths: Sequence[str], *, return_paths: Literal[True]
-) -> Iterator[tuple[pathlib.Path, dict]]:
-    ...
+) -> Iterator[tuple[pathlib.Path, dict]]: ...
 
 
 def collect_yaml(
@@ -415,10 +413,13 @@ class set:
     def __init__(
         self,
         arg: Mapping | None = None,
-        config: dict = config,
+        config: dict | None = None,
         lock: threading.Lock = config_lock,
         **kwargs,
     ):
+        if config is None:  # Keep Sphinx autofunction documentation clean
+            config = global_config
+
         with lock:
             self.config = config
             self._record = []
@@ -524,7 +525,7 @@ def collect(paths: list[str] = paths, env: Mapping[str, str] | None = None) -> d
 
 
 def refresh(
-    config: dict = config, defaults: list[Mapping] = defaults, **kwargs
+    config: dict | None = None, defaults: list[Mapping] = defaults, **kwargs
 ) -> None:
     """
     Update configuration by re-reading yaml files and env variables
@@ -550,6 +551,9 @@ def refresh(
     dask.config.collect: for parameters
     dask.config.update_defaults
     """
+    if config is None:  # Keep Sphinx autofunction documentation clean
+        config = global_config
+
     config.clear()
 
     for d in defaults:
@@ -562,7 +566,7 @@ def refresh(
 def get(
     key: str,
     default: Any = no_default,
-    config: dict = config,
+    config: dict | None = None,
     override_with: Any = None,
 ) -> Any:
     """
@@ -597,6 +601,10 @@ def get(
     """
     if override_with is not None:
         return override_with
+
+    if config is None:  # Keep Sphinx autofunction documentation clean
+        config = global_config
+
     keys = key.split(".")
     result = config
     for k in keys:
@@ -694,7 +702,6 @@ deprecations: dict[str, str | None] = {
     "fuse-ave-width": "optimization.fuse.ave-width",
     "fuse-max-height": "optimization.fuse.max-height",
     "fuse-max-width": "optimization.fuse.max-width",
-    "fuse-subgraphs": "optimization.fuse.subgraphs",
     "fuse-rename-keys": "optimization.fuse.rename-keys",
     "fuse-max-depth-new-edges": "optimization.fuse.max-depth-new-edges",
     # See https://github.com/dask/distributed/pull/4916
@@ -711,6 +718,7 @@ deprecations: dict[str, str | None] = {
     "dataframe.shuffle.algorithm": "dataframe.shuffle.method",
     "dataframe.shuffle-compression": "dataframe.shuffle.compression",
     "admin.traceback.shorten.what": "admin.traceback.shorten",  # changed in 2023.9.0
+    "array.shuffle.chunksize-tolerance": "array.chunk-size-tolerance",
 }
 
 
